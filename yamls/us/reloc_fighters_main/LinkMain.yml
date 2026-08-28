@@ -1,0 +1,149 @@
+# Exact LinkMain raw slice map
+# Parent reloc bundle: LinkMain
+# Reloc file_id: 225
+# Bundle ROM offset: 0x638404
+# Every entry below is a byte-exact slice of the decompressed LinkMain bundle.
+
+:config:
+  force: true
+  external_files:
+    - yamls/us/reloc_fighters_main.yml
+  ssb64_reloc_parent: LinkMain
+
+dLinkMain_file_handles:
+  type: BLOB
+  symbol: dLinkMain_file_handles
+  offset: 0x0
+  size: 0xC0
+
+dLinkMain_animlock:
+  type: BLOB
+  symbol: dLinkMain_animlock
+  offset: 0xC0
+  size: 0x8
+
+dLinkMain_setup_parts:
+  type: BLOB
+  symbol: dLinkMain_setup_parts
+  offset: 0xC8
+  size: 0x8
+
+dLinkMain_hiddenparts:
+  type: BLOB
+  symbol: dLinkMain_hiddenparts
+  offset: 0xD0
+  size: 0x60
+
+dLinkMain_modelparts_desc_0x130:
+  type: BLOB
+  symbol: dLinkMain_modelparts_desc_0x130
+  offset: 0x130
+  size: 0x78
+
+dLinkMain_modelparts_desc_0x1A8:
+  type: BLOB
+  symbol: dLinkMain_modelparts_desc_0x1A8
+  offset: 0x1A8
+  size: 0x28
+
+dLinkMain_modelparts_desc_0x1D0:
+  type: BLOB
+  symbol: dLinkMain_modelparts_desc_0x1D0
+  offset: 0x1D0
+  size: 0x28
+
+dLinkMain_modelparts_desc_0x1F8:
+  type: BLOB
+  symbol: dLinkMain_modelparts_desc_0x1F8
+  offset: 0x1F8
+  size: 0x28
+
+dLinkMain_modelparts_desc_0x220:
+  type: BLOB
+  symbol: dLinkMain_modelparts_desc_0x220
+  offset: 0x220
+  size: 0x28
+
+dLinkMain_modelparts_desc_0x248:
+  type: BLOB
+  symbol: dLinkMain_modelparts_desc_0x248
+  offset: 0x248
+  size: 0x28
+
+dLinkMain_modelparts_desc_0x270:
+  type: BLOB
+  symbol: dLinkMain_modelparts_desc_0x270
+  offset: 0x270
+  size: 0x28
+
+dLinkMain_modelparts_desc_0x298:
+  type: BLOB
+  symbol: dLinkMain_modelparts_desc_0x298
+  offset: 0x298
+  size: 0x50
+
+dLinkMain_modelparts_desc_0x2E8:
+  type: BLOB
+  symbol: dLinkMain_modelparts_desc_0x2E8
+  offset: 0x2E8
+  size: 0x50
+
+dLinkMain_modelparts_desc_0x338:
+  type: BLOB
+  symbol: dLinkMain_modelparts_desc_0x338
+  offset: 0x338
+  size: 0x50
+
+dLinkMain_modelparts_container:
+  type: BLOB
+  symbol: dLinkMain_modelparts_container
+  offset: 0x388
+  size: 0x80
+
+dLinkMain_textureparts_container:
+  type: BLOB
+  symbol: dLinkMain_textureparts_container
+  offset: 0x408
+  size: 0x8
+
+dLinkMain_commonparts_container:
+  type: BLOB
+  symbol: dLinkMain_commonparts_container
+  offset: 0x410
+  size: 0x20
+
+dLinkMain_thrown_status:
+  type: BLOB
+  symbol: dLinkMain_thrown_status
+  offset: 0x430
+  size: 0x1B0
+
+dLinkMain_stock_luts:
+  type: BLOB
+  symbol: dLinkMain_stock_luts
+  offset: 0x5E0
+  size: 0x10
+
+dLinkMain_sprites:
+  type: BLOB
+  symbol: dLinkMain_sprites
+  offset: 0x5F0
+  size: 0xC
+
+dLinkMain_skeleton_dls:
+  type: BLOB
+  symbol: dLinkMain_skeleton_dls
+  offset: 0x5FC
+  size: 0x100
+
+dLinkMain_skeleton:
+  type: BLOB
+  symbol: dLinkMain_skeleton
+  offset: 0x6FC
+  size: 0xC
+
+dLinkMain_attr:
+  type: BLOB
+  symbol: dLinkMain_attr
+  offset: 0x708
+  size: 0x348

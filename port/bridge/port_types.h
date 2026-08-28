@@ -18,8 +18,8 @@
 // On MSVC (LLP64): unsigned long is 4 bytes, matching N64's u32.
 // On GCC/Clang LP64: unsigned long is 8 bytes — use unsigned int instead.
 #ifdef _MSC_VER
-typedef unsigned long u32;
-typedef long s32;
+typedef unsigned int u32;
+typedef int s32;
 #else
 typedef uint32_t u32;
 typedef int32_t s32;

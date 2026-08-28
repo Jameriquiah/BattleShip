@@ -228,6 +228,7 @@ LinkMain:
   size: 0x4CA
   symbol: LinkMain
   file_id: 225
+  archive: false
   # compressed: True
   # decompressed_size: 0xA50
 
@@ -678,6 +679,7 @@ LinkModel:
   size: 0x7678
   symbol: LinkModel
   file_id: 324
+  archive: false
   # compressed: True
   # decompressed_size: 0x11F70
 

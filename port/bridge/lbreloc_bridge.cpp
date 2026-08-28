@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 #if defined(__unix__) || defined(__APPLE__)
@@ -29,6 +30,11 @@
 #include "resource/RelocFileTable.h"
 #include "resource/RelocPointerTable.h"
 #include "bridge/lbreloc_byteswap.h"
+#include <ship/resource/type/Blob.h>
+#include <fast/resource/type/DisplayList.h>
+#include <fast/resource/type/Texture.h>
+#include <fast/resource/type/Vertex.h>
+#include <ship/utils/StrHash64.h>
 
 extern "C" void port_aobj_register_halfswapped_range(void *base, unsigned long size);
 
@@ -131,6 +137,384 @@ struct PortRelocFileRange
 };
 
 static std::vector<PortRelocFileRange> sPortRelocFileRanges;
+
+#include "ssb64_reloc_rebuild.generated.inc"
+
+static constexpr uint8_t kOTRGSetTImgHash = 0x20;
+static constexpr uint8_t kOTRGDlHash = 0x31;
+static constexpr uint8_t kOTRGVtxHash = 0x32;
+static constexpr uint8_t kOTRGMarker = 0x33;
+static constexpr uint8_t kOTRGMoveMemHash = 0x42;
+
+static uint32_t portReadHash64Upper(const Gfx &cmd)
+{
+    return static_cast<uint32_t>(cmd.words.w0);
+}
+
+static uint32_t portReadHash64Lower(const Gfx &cmd)
+{
+    return static_cast<uint32_t>(cmd.words.w1);
+}
+
+static uint64_t portReadHash64(const Gfx &cmd)
+{
+    return (static_cast<uint64_t>(portReadHash64Upper(cmd)) << 32) | portReadHash64Lower(cmd);
+}
+
+static void portWriteBE16(std::vector<uint8_t> &out, size_t offset, uint16_t value)
+{
+    out[offset + 0] = static_cast<uint8_t>((value >> 8) & 0xFF);
+    out[offset + 1] = static_cast<uint8_t>(value & 0xFF);
+}
+
+static void portWriteBE32(std::vector<uint8_t> &out, size_t offset, uint32_t value)
+{
+    out[offset + 0] = static_cast<uint8_t>((value >> 24) & 0xFF);
+    out[offset + 1] = static_cast<uint8_t>((value >> 16) & 0xFF);
+    out[offset + 2] = static_cast<uint8_t>((value >> 8) & 0xFF);
+    out[offset + 3] = static_cast<uint8_t>(value & 0xFF);
+}
+
+static bool portIsInjectedHashPair(const Gfx &first, const Gfx &second)
+{
+    return (first.words.w0 == second.words.w0) && (first.words.w1 == second.words.w1);
+}
+
+static bool portSerializeVertexSlice(const Fast::Vertex &vertex, const SSB64SyntheticSlice &slice, std::vector<uint8_t> &out)
+{
+    if ((vertex.VertexList.size() * sizeof(Vtx)) != slice.size)
+    {
+        spdlog::error("lbReloc bridge: vertex slice '{}' size mismatch (got {} verts, expected 0x{:X} bytes)",
+                      slice.path, vertex.VertexList.size(), slice.size);
+        return false;
+    }
+
+    size_t cursor = slice.offset;
+    for (const auto &v : vertex.VertexList)
+    {
+        portWriteBE16(out, cursor + 0x0, static_cast<uint16_t>(v.v.ob[0]));
+        portWriteBE16(out, cursor + 0x2, static_cast<uint16_t>(v.v.ob[1]));
+        portWriteBE16(out, cursor + 0x4, static_cast<uint16_t>(v.v.ob[2]));
+        portWriteBE16(out, cursor + 0x6, v.v.flag);
+        portWriteBE16(out, cursor + 0x8, static_cast<uint16_t>(v.v.tc[0]));
+        portWriteBE16(out, cursor + 0xA, static_cast<uint16_t>(v.v.tc[1]));
+        out[cursor + 0xC] = v.v.cn[0];
+        out[cursor + 0xD] = v.v.cn[1];
+        out[cursor + 0xE] = v.v.cn[2];
+        out[cursor + 0xF] = v.v.cn[3];
+        cursor += sizeof(Vtx);
+    }
+
+    return true;
+}
+
+static bool portSerializeDisplayListSlice(const Fast::DisplayList &dl, const SSB64SyntheticRelocSpec &spec,
+                                          const SSB64SyntheticSlice &slice, std::vector<uint8_t> &out)
+{
+    std::unordered_map<uint64_t, const SSB64SyntheticSlice *> hashToSlice;
+    hashToSlice.reserve(spec.slice_count);
+    for (size_t i = 0; i < spec.slice_count; i++)
+    {
+        const auto &candidate = spec.slices[i];
+        hashToSlice.emplace(CRC64(candidate.path), &candidate);
+    }
+
+    std::vector<uint32_t> words;
+    words.reserve(dl.Instructions.size() * 2);
+    bool skipArtificialBranchEnd = false;
+
+    for (size_t i = 0; i < dl.Instructions.size(); i++)
+    {
+        const auto &cmd = dl.Instructions[i];
+        const uint32_t w0 = static_cast<uint32_t>(cmd.words.w0);
+        const uint32_t w1 = static_cast<uint32_t>(cmd.words.w1);
+        const uint8_t opcode = static_cast<uint8_t>(w0 >> 24);
+
+        if (skipArtificialBranchEnd && opcode == 0xDF)
+        {
+            skipArtificialBranchEnd = false;
+            continue;
+        }
+        skipArtificialBranchEnd = false;
+
+        if (opcode == kOTRGMarker)
+        {
+            i++;
+            continue;
+        }
+
+        if (opcode == kOTRGVtxHash)
+        {
+            if ((i + 1) >= dl.Instructions.size())
+            {
+                spdlog::error("lbReloc bridge: truncated VTX OTR command in '{}'", slice.path);
+                return false;
+            }
+
+            const auto &hashCmd = dl.Instructions[++i];
+            uint32_t ptr = w1;
+
+            if (!portIsInjectedHashPair(cmd, hashCmd))
+            {
+                auto it = hashToSlice.find(portReadHash64(hashCmd));
+                if (it == hashToSlice.end())
+                {
+                    spdlog::error("lbReloc bridge: unresolved VTX hash 0x{:016X} in '{}'",
+                                  portReadHash64(hashCmd), slice.path);
+                    return false;
+                }
+                ptr = it->second->offset + w1;
+            }
+
+            const uint32_t nvtx = (w0 >> 12) & 0xFF;
+            const uint32_t didx = ((w0 >> 1) & 0x7F) - nvtx;
+            words.push_back((0x01u << 24) | (nvtx << 12) | ((didx + nvtx) << 1));
+            words.push_back(ptr);
+            continue;
+        }
+
+        if (opcode == kOTRGDlHash)
+        {
+            if ((i + 1) >= dl.Instructions.size())
+            {
+                spdlog::error("lbReloc bridge: truncated DL OTR command in '{}'", slice.path);
+                return false;
+            }
+
+            const auto &hashCmd = dl.Instructions[++i];
+            uint32_t ptr = w1;
+            if (!portIsInjectedHashPair(cmd, hashCmd))
+            {
+                auto it = hashToSlice.find(portReadHash64(hashCmd));
+                if (it != hashToSlice.end())
+                {
+                    ptr = it->second->offset;
+                }
+            }
+
+            const uint32_t branch = (w0 >> 16) & 0xFF;
+            words.push_back((0xDEu << 24) | (branch << 16));
+            words.push_back(ptr);
+            skipArtificialBranchEnd = (branch & G_DL_NOPUSH) != 0;
+            continue;
+        }
+
+        if (opcode == kOTRGSetTImgHash)
+        {
+            if ((i + 1) >= dl.Instructions.size())
+            {
+                spdlog::error("lbReloc bridge: truncated TEX OTR command in '{}'", slice.path);
+                return false;
+            }
+
+            const auto &hashCmd = dl.Instructions[++i];
+            uint32_t ptr = w1;
+            if (!portIsInjectedHashPair(cmd, hashCmd))
+            {
+                auto it = hashToSlice.find(portReadHash64(hashCmd));
+                if (it == hashToSlice.end())
+                {
+                    spdlog::error("lbReloc bridge: unresolved texture hash 0x{:016X} in '{}'",
+                                  portReadHash64(hashCmd), slice.path);
+                    return false;
+                }
+                ptr = it->second->offset;
+            }
+
+            words.push_back((0xFDu << 24) | (w0 & 0x00FFFFFFu));
+            words.push_back(ptr);
+            continue;
+        }
+
+        if (opcode == kOTRGMoveMemHash)
+        {
+            if ((i + 1) >= dl.Instructions.size())
+            {
+                spdlog::error("lbReloc bridge: truncated MOVEMEM OTR command in '{}'", slice.path);
+                return false;
+            }
+
+            const auto &hashCmd = dl.Instructions[++i];
+            if (portIsInjectedHashPair(cmd, hashCmd))
+            {
+                spdlog::error("lbReloc bridge: unresolved MOVEMEM hash in '{}'", slice.path);
+                return false;
+            }
+
+            auto it = hashToSlice.find(portReadHash64(hashCmd));
+            if (it == hashToSlice.end())
+            {
+                spdlog::error("lbReloc bridge: unresolved MOVEMEM hash 0x{:016X} in '{}'",
+                              portReadHash64(hashCmd), slice.path);
+                return false;
+            }
+
+            const bool hasOffset = ((w1 >> 8) & 0xFF) != 0;
+            const uint32_t ptr = it->second->offset + (hasOffset ? 8u : 0u);
+            words.push_back((0xDCu << 24) | (w0 & 0x00FFFFFFu));
+            words.push_back(ptr);
+            continue;
+        }
+
+        words.push_back(w0);
+        words.push_back(w1);
+    }
+
+    if ((words.size() * sizeof(uint32_t)) != slice.size)
+    {
+        spdlog::error("lbReloc bridge: display list slice '{}' size mismatch (got 0x{:X}, expected 0x{:X})",
+                      slice.path, static_cast<uint32_t>(words.size() * sizeof(uint32_t)), slice.size);
+        return false;
+    }
+
+    for (size_t i = 0; i < words.size(); i++)
+    {
+        portWriteBE32(out, slice.offset + (i * sizeof(uint32_t)), words[i]);
+    }
+    return true;
+}
+
+static void portDumpSyntheticRelocIfRequested(const SSB64SyntheticRelocSpec &spec, const RelocFile &relocFile)
+{
+	const char *dumpAll = getenv("SSB64_DUMP_SYNTH_RELOC");
+	const char *dumpOne = getenv("SSB64_DUMP_SYNTH_RELOC_FILE_ID");
+	bool shouldDump = false;
+
+	if (dumpAll != nullptr && dumpAll[0] == '1')
+	{
+		shouldDump = true;
+	}
+	if (dumpOne != nullptr)
+	{
+		unsigned long targetId = strtoul(dumpOne, nullptr, 0);
+		if (targetId == spec.file_id)
+		{
+			shouldDump = true;
+		}
+	}
+	if (!shouldDump)
+	{
+		return;
+	}
+
+	char path[256];
+	snprintf(path, sizeof(path), "debug_traces/synth_reloc_%u.bin", spec.file_id);
+	FILE *df = fopen(path, "wb");
+	if (df != nullptr)
+	{
+		fwrite(relocFile.Data.data(), 1, relocFile.Data.size(), df);
+		fclose(df);
+		spdlog::info("lbReloc bridge: wrote synthetic dump for '{}' to {}", spec.parent_path, path);
+	}
+}
+
+static std::shared_ptr<RelocFile> portBuildSyntheticRelocResource(uint32_t file_id)
+{
+    const auto *spec = portGetSyntheticRelocSpec(file_id);
+    if (spec == nullptr)
+    {
+        return nullptr;
+    }
+
+    auto ctx = Ship::Context::GetInstance();
+    if (!ctx)
+    {
+        spdlog::error("lbReloc bridge: no Ship::Context for synthetic file_id {}", file_id);
+        return nullptr;
+    }
+
+    auto relocFile = std::make_shared<RelocFile>(std::shared_ptr<Ship::ResourceInitData>());
+    relocFile->FileId = spec->file_id;
+    relocFile->RelocInternOffset = spec->reloc_intern_offset;
+    relocFile->RelocExternOffset = spec->reloc_extern_offset;
+    relocFile->ExternFileIds.assign(spec->extern_file_ids, spec->extern_file_ids + spec->extern_file_ids_count);
+    relocFile->Data.assign(spec->data_size, 0);
+    relocFile->HasExplicitInternOffsets = true;
+    relocFile->ExplicitInternOffsets.assign(spec->explicit_intern_offsets,
+                                            spec->explicit_intern_offsets + spec->explicit_intern_offsets_count);
+
+    for (size_t i = 0; i < spec->slice_count; i++)
+    {
+        const auto &slice = spec->slices[i];
+        auto resource = ctx->GetResourceManager()->LoadResource(slice.path);
+        if (!resource)
+        {
+            spdlog::error("lbReloc bridge: synthetic parent '{}' missing child '{}'", spec->parent_path, slice.path);
+            return nullptr;
+        }
+
+        if ((slice.offset + slice.size) > relocFile->Data.size())
+        {
+            spdlog::error("lbReloc bridge: synthetic slice '{}' overflows parent '{}'", slice.path, spec->parent_path);
+            return nullptr;
+        }
+
+        switch (slice.kind)
+        {
+        case SSB64SyntheticSliceKind::Blob:
+        {
+            auto blob = std::dynamic_pointer_cast<Ship::Blob>(resource);
+            if (!blob)
+            {
+                spdlog::error("lbReloc bridge: child '{}' is not a Blob", slice.path);
+                return nullptr;
+            }
+            std::memcpy(relocFile->Data.data() + slice.offset, blob->Data.data(), slice.size);
+            break;
+        }
+        case SSB64SyntheticSliceKind::Texture:
+        {
+            auto texture = std::dynamic_pointer_cast<Fast::Texture>(resource);
+            if (!texture)
+            {
+                spdlog::error("lbReloc bridge: child '{}' is not a Texture", slice.path);
+                return nullptr;
+            }
+            if (texture->ImageDataSize < slice.size)
+            {
+                spdlog::error("lbReloc bridge: texture slice '{}' too small (got 0x{:X}, expected 0x{:X})",
+                              slice.path, texture->ImageDataSize, slice.size);
+                return nullptr;
+            }
+            std::memcpy(relocFile->Data.data() + slice.offset, texture->ImageData, slice.size);
+            break;
+        }
+        case SSB64SyntheticSliceKind::Vertex:
+        {
+            auto vertex = std::dynamic_pointer_cast<Fast::Vertex>(resource);
+            if (!vertex)
+            {
+                spdlog::error("lbReloc bridge: child '{}' is not a Vertex", slice.path);
+                return nullptr;
+            }
+            if (!portSerializeVertexSlice(*vertex, slice, relocFile->Data))
+            {
+                return nullptr;
+            }
+            break;
+        }
+        case SSB64SyntheticSliceKind::DisplayList:
+        {
+            auto displayList = std::dynamic_pointer_cast<Fast::DisplayList>(resource);
+            if (!displayList)
+            {
+                spdlog::error("lbReloc bridge: child '{}' is not a DisplayList", slice.path);
+                return nullptr;
+            }
+            if (!portSerializeDisplayListSlice(*displayList, *spec, slice, relocFile->Data))
+            {
+                return nullptr;
+            }
+            break;
+        }
+        }
+    }
+
+    spdlog::info("lbReloc bridge: synthesized '{}' from {} child assets", spec->parent_path, spec->slice_count);
+    portDumpSyntheticRelocIfRequested(*spec, *relocFile);
+    return relocFile;
+}
+
 
 static void portRelocEvictFileRangesInRange(void *base, size_t size)
 {
@@ -326,6 +710,17 @@ static std::shared_ptr<RelocFile> portLoadRelocResource(u32 file_id)
 	}
 
 	std::string path(gRelocFileTable[file_id]);
+
+	if (const auto *spec = portGetSyntheticRelocSpec(file_id))
+	{
+		auto synthetic = portBuildSyntheticRelocResource(file_id);
+		if (synthetic)
+		{
+			return synthetic;
+		}
+		spdlog::warn("lbReloc bridge: synthetic build failed for '{}' , falling back to archived parent", spec->parent_path);
+	}
+
 	auto resource = ctx->GetResourceManager()->LoadResource(path);
 
 	if (!resource)
@@ -524,6 +919,9 @@ extern "C" void portRelocLoadFileFromBytes(
 	unsigned short  reloc_extern_offset,
 	const unsigned short *extern_file_ids,
 	unsigned int    extern_count,
+	int             has_explicit_intern_offsets,
+	const unsigned int *explicit_intern_offsets,
+	unsigned int    explicit_intern_count,
 	int             force_figatree_fixup)
 {
 	/* portRelocIsFighterFigatreeFile looks up gRelocFileTable[file_id]
@@ -674,8 +1072,44 @@ extern "C" void portRelocLoadFileFromBytes(
 	// In the port, we compute the pointer, register it as a token, and
 	// write the 32-bit token into the 4-byte word.
 
-	u16 reloc_intern = reloc_intern_offset;
-	u32 intern_steps = 0;
+	if (has_explicit_intern_offsets)
+	{
+		for (unsigned int explicit_idx = 0; explicit_idx < explicit_intern_count; explicit_idx++)
+		{
+			uint32_t slot_byte_off = explicit_intern_offsets[explicit_idx];
+			if ((static_cast<size_t>(slot_byte_off) + sizeof(u32)) > copySize)
+			{
+				spdlog::error("lbReloc bridge: file_id {} explicit intern slot OOB (slot_off=0x{:X}, copySize=0x{:X})",
+				              file_id, slot_byte_off, static_cast<uint32_t>(copySize));
+				break;
+			}
+
+			u32 *slot = (u32 *)((uintptr_t)ram_dst + slot_byte_off);
+			uint32_t target_byte_off = *slot;
+			if (static_cast<size_t>(target_byte_off) >= copySize)
+			{
+				spdlog::error("lbReloc bridge: file_id {} explicit intern target OOB (slot_off=0x{:X}, target_off=0x{:X}, copySize=0x{:X})",
+				              file_id, slot_byte_off, target_byte_off, static_cast<uint32_t>(copySize));
+				break;
+			}
+
+			portRelocFixupTextureFromChain(ram_dst, copySize, slot_byte_off, target_byte_off);
+
+			void *target = (void *)((uintptr_t)ram_dst + target_byte_off);
+			u32 token = portRelocRegisterPointer(target);
+
+			if (is_fighter_figatree && ((slot_byte_off / sizeof(u32)) < figatree_reloc_words.size()))
+			{
+				figatree_reloc_words[slot_byte_off / sizeof(u32)] = 1;
+			}
+			*slot = token;
+			portRelocNoteChainSlot(slot);
+		}
+	}
+	else
+	{
+		u16 reloc_intern = reloc_intern_offset;
+		u32 intern_steps = 0;
 
 	while (reloc_intern != 0xFFFF)
 	{
@@ -752,6 +1186,7 @@ extern "C" void portRelocLoadFileFromBytes(
 		}
 
 		reloc_intern = next_reloc;
+	}
 	}
 
 	// --- External pointer relocation (token-based) ---
@@ -994,6 +1429,9 @@ void lbRelocLoadAndRelocFile(u32 file_id, void *ram_dst, u32 bytes_num, s32 loc)
 		relocFile->RelocExternOffset,
 		relocFile->ExternFileIds.data(),
 		(unsigned int)relocFile->ExternFileIds.size(),
+		relocFile->HasExplicitInternOffsets ? 1 : 0,
+		relocFile->ExplicitInternOffsets.data(),
+		(unsigned int)relocFile->ExplicitInternOffsets.size(),
 		/* force_figatree_fixup = */ 0);
 }
 
